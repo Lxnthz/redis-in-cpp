@@ -476,8 +476,9 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
       listValues->push_back(cmd[i]);
     }
 
+    long long lengthAfterPush = static_cast<long long>(listValues->size());
     wakePendingBlpopRequests();
-    return {true, encodeInteger(static_cast<long long>(listValues->size()))};
+    return {true, encodeInteger(lengthAfterPush)};
   }
 
   if (command == "LPUSH" && cmd.size() >= 3) {
@@ -490,8 +491,9 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
       listValues->insert(listValues->begin(), cmd[i]);
     }
 
+    long long lengthAfterPush = static_cast<long long>(listValues->size());
     wakePendingBlpopRequests();
-    return {true, encodeInteger(static_cast<long long>(listValues->size()))};
+    return {true, encodeInteger(lengthAfterPush)};
   }
 
   if (command == "LRANGE" && cmd.size() >= 4) {
