@@ -1,10 +1,14 @@
 #include <algorithm>
+#include <cctype>
+#include <climits>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -16,6 +20,7 @@
 using SocketType = SOCKET;
 static constexpr SocketType kInvalidSocket = INVALID_SOCKET;
 #else
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -26,12 +31,20 @@ using SocketType = int;
 static constexpr SocketType kInvalidSocket = -1;
 #endif
 
-enum class ValueType { kString, kList };
+enum class ValueType { kString, kList, kStream };
+
+struct StreamItem {
+  std::string id;
+  std::vector<std::pair<std::string, std::string>> fields;
+};
 
 struct Entry {
   ValueType type;
   std::string stringValue;
   std::vector<std::string> listValue;
+  std::vector<StreamItem> streamValue;
+  long long streamLastMs;
+  long long streamLastSeq;
   std::optional<std::chrono::steady_clock::time_point> expiresAt;
 };
 
@@ -41,9 +54,17 @@ struct BlpopRequest {
   std::optional<std::chrono::steady_clock::time_point> deadline;
 };
 
+struct XreadRequest {
+  SocketType connection;
+  std::vector<std::string> keys;
+  std::vector<std::pair<long long, long long>> cursors;
+  std::optional<std::chrono::steady_clock::time_point> deadline;
+};
+
 static std::unordered_map<std::string, Entry> store;
 static std::unordered_map<SocketType, std::string> connectionBuffers;
 static std::vector<BlpopRequest> pendingBlpopRequests;
+static std::vector<XreadRequest> pendingXreadRequests;
 static std::unordered_set<SocketType> socketsToClose;
 
 struct CommandResult {
@@ -112,7 +133,7 @@ static Entry* getEntry(const std::string& key) {
 static std::vector<std::string>* getListForWrite(const std::string& key) {
   Entry* entry = getEntry(key);
   if (entry == nullptr) {
-    store[key] = Entry{ValueType::kList, "", {}, std::nullopt};
+    store[key] = Entry{ValueType::kList, "", {}, {}, 0, 0, std::nullopt};
     return &store[key].listValue;
   }
 
@@ -134,6 +155,127 @@ static std::vector<std::string>* getListForRead(const std::string& key) {
   }
 
   return &entry->listValue;
+}
+
+static Entry* getStreamEntryForWrite(const std::string& key, bool& wrongType) {
+  wrongType = false;
+  Entry* entry = getEntry(key);
+  if (entry == nullptr) {
+    store[key] = Entry{ValueType::kStream, "", {}, {}, 0, 0, std::nullopt};
+    return &store[key];
+  }
+
+  if (entry->type != ValueType::kStream) {
+    wrongType = true;
+    return nullptr;
+  }
+
+  return entry;
+}
+
+static Entry* getStreamEntryForRead(const std::string& key, bool& wrongType) {
+  wrongType = false;
+  Entry* entry = getEntry(key);
+  if (entry == nullptr) {
+    return nullptr;
+  }
+
+  if (entry->type != ValueType::kStream) {
+    wrongType = true;
+    return nullptr;
+  }
+
+  return entry;
+}
+
+static std::optional<std::pair<long long, long long>> parseStreamId(const std::string& token) {
+  size_t dash = token.find('-');
+  if (dash == std::string::npos || dash == 0 || dash + 1 >= token.size()) {
+    return std::nullopt;
+  }
+
+  std::string msText = token.substr(0, dash);
+  std::string seqText = token.substr(dash + 1);
+  if (msText.empty() || seqText.empty()) {
+    return std::nullopt;
+  }
+
+  char* end = nullptr;
+  long long ms = std::strtoll(msText.c_str(), &end, 10);
+  if (*end != '\0' || ms < 0) {
+    return std::nullopt;
+  }
+
+  end = nullptr;
+  long long seq = std::strtoll(seqText.c_str(), &end, 10);
+  if (*end != '\0' || seq < 0) {
+    return std::nullopt;
+  }
+
+  return std::make_pair(ms, seq);
+}
+
+static std::optional<long long> parseNonNegativeLongLong(const std::string& token) {
+  if (token.empty()) {
+    return std::nullopt;
+  }
+
+  char* end = nullptr;
+  long long value = std::strtoll(token.c_str(), &end, 10);
+  if (*end != '\0' || value < 0) {
+    return std::nullopt;
+  }
+
+  return value;
+}
+
+static bool streamIdGreater(const std::pair<long long, long long>& lhs,
+                            const std::pair<long long, long long>& rhs) {
+  if (lhs.first != rhs.first) {
+    return lhs.first > rhs.first;
+  }
+  return lhs.second > rhs.second;
+}
+
+static bool streamIdLessOrEqual(const std::pair<long long, long long>& lhs,
+                                const std::pair<long long, long long>& rhs) {
+  if (lhs.first != rhs.first) {
+    return lhs.first < rhs.first;
+  }
+  return lhs.second <= rhs.second;
+}
+
+static std::string streamIdToString(const std::pair<long long, long long>& id) {
+  return std::to_string(id.first) + "-" + std::to_string(id.second);
+}
+
+static std::pair<long long, long long> generateStreamId(Entry* streamEntry,
+                                                        std::optional<long long> requestedMs,
+                                                        bool& ok,
+                                                        std::string& error) {
+  long long currentMs = static_cast<long long>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  if (requestedMs.has_value()) {
+    currentMs = *requestedMs;
+  }
+
+  if (currentMs < streamEntry->streamLastMs) {
+    ok = false;
+    error = "ERR The ID specified in XADD is equal or smaller than the target stream top item";
+    return {0, 0};
+  }
+
+  if (currentMs == streamEntry->streamLastMs) {
+    streamEntry->streamLastSeq += 1;
+  } else {
+    streamEntry->streamLastMs = currentMs;
+    streamEntry->streamLastSeq = 0;
+  }
+
+  ok = true;
+  return {streamEntry->streamLastMs, streamEntry->streamLastSeq};
 }
 
 static std::optional<std::string> getStringValue(const std::string& key) {
@@ -256,6 +398,39 @@ static std::string encodeNullArray() {
   return "*-1\r\n";
 }
 
+static std::string encodeStreamItem(const StreamItem& item) {
+  std::string response = "*2\r\n";
+  response += encodeBulk(item.id);
+
+  std::vector<std::string> flattened;
+  flattened.reserve(item.fields.size() * 2);
+  for (const auto& kv : item.fields) {
+    flattened.push_back(kv.first);
+    flattened.push_back(kv.second);
+  }
+  response += encodeArray(flattened);
+  return response;
+}
+
+static std::string encodeStreamItemsArray(const std::vector<StreamItem>& items) {
+  std::string response = "*" + std::to_string(items.size()) + "\r\n";
+  for (const auto& item : items) {
+    response += encodeStreamItem(item);
+  }
+  return response;
+}
+
+static std::string encodeXreadResponse(
+    const std::vector<std::pair<std::string, std::vector<StreamItem>>>& streamGroups) {
+  std::string response = "*" + std::to_string(streamGroups.size()) + "\r\n";
+  for (const auto& group : streamGroups) {
+    response += "*2\r\n";
+    response += encodeBulk(group.first);
+    response += encodeStreamItemsArray(group.second);
+  }
+  return response;
+}
+
 static std::string toUpper(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(),
                  [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
@@ -280,6 +455,101 @@ static std::vector<std::string> trimLrange(const std::vector<std::string>& value
   }
 
   return std::vector<std::string>(values.begin() + start, values.begin() + stop + 1);
+}
+
+static std::pair<long long, long long> parseXrangeBound(const std::string& token, bool isStart,
+                                                        bool& valid, bool& isLowInf,
+                                                        bool& isHighInf) {
+  valid = true;
+  isLowInf = false;
+  isHighInf = false;
+
+  if (token == "-") {
+    isLowInf = true;
+    return {0, 0};
+  }
+
+  if (token == "+") {
+    isHighInf = true;
+    return {0, 0};
+  }
+
+  size_t dash = token.find('-');
+  if (dash == std::string::npos) {
+    auto parsedMs = parseNonNegativeLongLong(token);
+    if (!parsedMs.has_value()) {
+      valid = false;
+      return {0, 0};
+    }
+    if (isStart) {
+      return {*parsedMs, 0};
+    }
+    return {*parsedMs, std::numeric_limits<long long>::max()};
+  }
+
+  auto parsed = parseStreamId(token);
+  if (!parsed.has_value()) {
+    valid = false;
+    return {0, 0};
+  }
+  return *parsed;
+}
+
+static std::vector<StreamItem> collectXrangeEntries(const Entry* streamEntry,
+                                                    const std::pair<long long, long long>& start,
+                                                    const std::pair<long long, long long>& end,
+                                                    bool lowInf, bool highInf) {
+  std::vector<StreamItem> items;
+  for (const auto& item : streamEntry->streamValue) {
+    auto parsed = parseStreamId(item.id);
+    if (!parsed.has_value()) {
+      continue;
+    }
+
+    bool geStart = lowInf || streamIdGreater(*parsed, start) || *parsed == start;
+    bool leEnd = highInf || streamIdLessOrEqual(*parsed, end);
+
+    if (geStart && leEnd) {
+      items.push_back(item);
+    }
+  }
+  return items;
+}
+
+static bool resolveXreadCursor(const std::string& key, const std::string& token,
+                               std::pair<long long, long long>& cursor, bool& wrongType,
+                               bool& invalid) {
+  wrongType = false;
+  invalid = false;
+
+  if (token != "$") {
+    auto parsed = parseStreamId(token);
+    if (!parsed.has_value()) {
+      invalid = true;
+      return false;
+    }
+    cursor = *parsed;
+    return true;
+  }
+
+  Entry* streamEntry = getStreamEntryForRead(key, wrongType);
+  if (wrongType) {
+    return false;
+  }
+
+  if (streamEntry == nullptr || streamEntry->streamValue.empty()) {
+    cursor = {0, 0};
+    return true;
+  }
+
+  auto last = parseStreamId(streamEntry->streamValue.back().id);
+  if (!last.has_value()) {
+    cursor = {0, 0};
+    return true;
+  }
+
+  cursor = *last;
+  return true;
 }
 
 static std::optional<std::vector<std::string>> popFromList(const std::string& key,
@@ -361,9 +631,112 @@ static void expirePendingBlpopRequests() {
   }
 }
 
+static std::vector<StreamItem> buildStreamEntriesAfterCursor(const Entry* streamEntry,
+                                                             const std::pair<long long, long long>& cursor) {
+  std::vector<StreamItem> result;
+  for (const auto& item : streamEntry->streamValue) {
+    auto parsed = parseStreamId(item.id);
+    if (!parsed.has_value()) {
+      continue;
+    }
+
+    if (streamIdGreater(*parsed, cursor)) {
+      result.push_back(item);
+    }
+  }
+  return result;
+}
+
+static bool buildXreadGroups(const std::vector<std::string>& keys,
+                             const std::vector<std::pair<long long, long long>>& cursors,
+                             std::vector<std::pair<std::string, std::vector<StreamItem>>>& groups,
+                             bool& wrongType) {
+  wrongType = false;
+  groups.clear();
+
+  for (size_t i = 0; i < keys.size(); i++) {
+    bool localWrongType = false;
+    Entry* streamEntry = getStreamEntryForRead(keys[i], localWrongType);
+    if (localWrongType) {
+      wrongType = true;
+      return false;
+    }
+
+    if (streamEntry == nullptr) {
+      continue;
+    }
+
+    std::vector<StreamItem> entries = buildStreamEntriesAfterCursor(streamEntry, cursors[i]);
+    if (!entries.empty()) {
+      groups.push_back({keys[i], entries});
+    }
+  }
+
+  return true;
+}
+
+static void wakePendingXreadRequests() {
+  size_t index = 0;
+  while (index < pendingXreadRequests.size()) {
+    bool wrongType = false;
+    std::vector<std::pair<std::string, std::vector<StreamItem>>> groups;
+    if (!buildXreadGroups(pendingXreadRequests[index].keys, pendingXreadRequests[index].cursors, groups,
+                          wrongType)) {
+      if (wrongType) {
+        if (!sendAll(pendingXreadRequests[index].connection,
+                     encodeError("WRONGTYPE Operation against a key holding the wrong kind of value"))) {
+          markSocketForClose(pendingXreadRequests[index].connection);
+        }
+        pendingXreadRequests.erase(pendingXreadRequests.begin() + static_cast<long long>(index));
+        continue;
+      }
+      index++;
+      continue;
+    }
+
+    if (groups.empty()) {
+      index++;
+      continue;
+    }
+
+    if (!sendAll(pendingXreadRequests[index].connection, encodeXreadResponse(groups))) {
+      markSocketForClose(pendingXreadRequests[index].connection);
+    }
+    pendingXreadRequests.erase(pendingXreadRequests.begin() + static_cast<long long>(index));
+  }
+}
+
+static void expirePendingXreadRequests() {
+  auto now = std::chrono::steady_clock::now();
+
+  size_t index = 0;
+  while (index < pendingXreadRequests.size()) {
+    if (!pendingXreadRequests[index].deadline.has_value() ||
+        now < *(pendingXreadRequests[index].deadline)) {
+      index++;
+      continue;
+    }
+
+    if (!sendAll(pendingXreadRequests[index].connection, encodeNullArray())) {
+      markSocketForClose(pendingXreadRequests[index].connection);
+    }
+    pendingXreadRequests.erase(pendingXreadRequests.begin() + static_cast<long long>(index));
+  }
+}
+
 static std::optional<std::chrono::steady_clock::duration> getNearestPendingDeadline() {
   std::optional<std::chrono::steady_clock::time_point> nearest;
   for (const auto& req : pendingBlpopRequests) {
+    if (!req.deadline.has_value()) {
+      continue;
+    }
+
+    if (!nearest.has_value() || req.deadline < nearest) {
+      nearest = req.deadline;
+    }
+  }
+
+  for (const auto& req : pendingXreadRequests) {
     if (!req.deadline.has_value()) {
       continue;
     }
@@ -396,10 +769,22 @@ static void removePendingBlpopForConnection(SocketType connection) {
   }
 }
 
+static void removePendingXreadForConnection(SocketType connection) {
+  size_t index = 0;
+  while (index < pendingXreadRequests.size()) {
+    if (pendingXreadRequests[index].connection == connection) {
+      pendingXreadRequests.erase(pendingXreadRequests.begin() + static_cast<long long>(index));
+      continue;
+    }
+    index++;
+  }
+}
+
 static void closeClient(SocketType connection, std::vector<SocketType>& clients) {
   closeSocket(connection);
   connectionBuffers.erase(connection);
   removePendingBlpopForConnection(connection);
+  removePendingXreadForConnection(connection);
   socketsToClose.erase(connection);
   clients.erase(std::remove(clients.begin(), clients.end(), connection), clients.end());
 }
@@ -455,7 +840,7 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
       }
     }
 
-    store[key] = Entry{ValueType::kString, value, {}, expiresAt};
+    store[key] = Entry{ValueType::kString, value, {}, {}, 0, 0, expiresAt};
     return {true, encodeSimple("OK")};
   }
 
@@ -464,6 +849,199 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
       return {true, encodeError("ERR wrong number of arguments for 'get' command")};
     }
     return {true, encodeBulk(getStringValue(cmd[1]))};
+  }
+
+  if (command == "TYPE" && cmd.size() >= 2) {
+    Entry* entry = getEntry(cmd[1]);
+    if (entry == nullptr) {
+      return {true, encodeSimple("none")};
+    }
+
+    if (entry->type == ValueType::kString) {
+      return {true, encodeSimple("string")};
+    }
+    if (entry->type == ValueType::kList) {
+      return {true, encodeSimple("list")};
+    }
+    return {true, encodeSimple("stream")};
+  }
+
+  if (command == "XADD" && cmd.size() >= 5) {
+    const std::string& key = cmd[1];
+    const std::string& idToken = cmd[2];
+    if ((cmd.size() - 3) % 2 != 0) {
+      return {true, encodeError("ERR wrong number of arguments for 'xadd' command")};
+    }
+
+    bool wrongType = false;
+    Entry* streamEntry = getStreamEntryForWrite(key, wrongType);
+    if (wrongType || streamEntry == nullptr) {
+      return {true, encodeError("WRONGTYPE Operation against a key holding the wrong kind of value")};
+    }
+
+    std::pair<long long, long long> nextId{0, 0};
+    if (idToken == "*") {
+      bool ok = false;
+      std::string error;
+      nextId = generateStreamId(streamEntry, std::nullopt, ok, error);
+      if (!ok) {
+        return {true, encodeError(error)};
+      }
+    } else {
+      size_t dash = idToken.find('-');
+      if (dash == std::string::npos) {
+        return {true, encodeError("ERR Invalid stream ID specified as stream command argument")};
+      }
+
+      std::string msText = idToken.substr(0, dash);
+      std::string seqText = idToken.substr(dash + 1);
+
+      if (seqText == "*") {
+        auto requestedMs = parseNonNegativeLongLong(msText);
+        if (!requestedMs.has_value()) {
+          return {true, encodeError("ERR Invalid stream ID specified as stream command argument")};
+        }
+
+        bool ok = false;
+        std::string error;
+        nextId = generateStreamId(streamEntry, *requestedMs, ok, error);
+        if (!ok) {
+          return {true, encodeError(error)};
+        }
+      } else {
+        auto parsed = parseStreamId(idToken);
+        if (!parsed.has_value()) {
+          return {true, encodeError("ERR Invalid stream ID specified as stream command argument")};
+        }
+
+        nextId = *parsed;
+        if (nextId.first == 0 && nextId.second == 0) {
+          return {true, encodeError("ERR The ID specified in XADD must be greater than 0-0")};
+        }
+
+        std::pair<long long, long long> top{streamEntry->streamLastMs, streamEntry->streamLastSeq};
+        if (!streamIdGreater(nextId, top)) {
+          return {
+              true,
+              encodeError("ERR The ID specified in XADD is equal or smaller than the target stream top item")};
+        }
+        streamEntry->streamLastMs = nextId.first;
+        streamEntry->streamLastSeq = nextId.second;
+      }
+    }
+
+    StreamItem item;
+    item.id = streamIdToString(nextId);
+    for (size_t i = 3; i < cmd.size(); i += 2) {
+      item.fields.push_back({cmd[i], cmd[i + 1]});
+    }
+    streamEntry->streamValue.push_back(item);
+
+    wakePendingXreadRequests();
+    return {true, encodeBulk(item.id)};
+  }
+
+  if (command == "XRANGE" && cmd.size() >= 4) {
+    bool wrongType = false;
+    Entry* streamEntry = getStreamEntryForRead(cmd[1], wrongType);
+    if (wrongType) {
+      return {true, encodeError("WRONGTYPE Operation against a key holding the wrong kind of value")};
+    }
+    if (streamEntry == nullptr) {
+      return {true, encodeArray({})};
+    }
+
+    bool startValid = false;
+    bool startLowInf = false;
+    bool startHighInf = false;
+    auto start = parseXrangeBound(cmd[2], true, startValid, startLowInf, startHighInf);
+    if (!startValid) {
+      return {true, encodeError("ERR Invalid stream ID specified as stream command argument")};
+    }
+
+    bool endValid = false;
+    bool endLowInf = false;
+    bool endHighInf = false;
+    auto end = parseXrangeBound(cmd[3], false, endValid, endLowInf, endHighInf);
+    if (!endValid) {
+      return {true, encodeError("ERR Invalid stream ID specified as stream command argument")};
+    }
+
+    std::vector<StreamItem> items =
+        collectXrangeEntries(streamEntry, start, end, startLowInf, endHighInf);
+    return {true, encodeStreamItemsArray(items)};
+  }
+
+  if (command == "XREAD") {
+    size_t index = 1;
+    std::optional<long long> blockMs = std::nullopt;
+
+    if (index < cmd.size() && toUpper(cmd[index]) == "BLOCK") {
+      if (index + 1 >= cmd.size()) {
+        return {true, encodeError("ERR wrong number of arguments for 'xread' command")};
+      }
+      auto parsed = parseNonNegativeLongLong(cmd[index + 1]);
+      if (!parsed.has_value()) {
+        return {true, encodeError("ERR timeout is not an integer or out of range")};
+      }
+      blockMs = *parsed;
+      index += 2;
+    }
+
+    if (index >= cmd.size() || toUpper(cmd[index]) != "STREAMS") {
+      return {true, encodeError("ERR syntax error")};
+    }
+
+    std::vector<std::string> values(cmd.begin() + static_cast<long long>(index + 1), cmd.end());
+    if (values.size() < 2 || values.size() % 2 != 0) {
+      return {true, encodeError("ERR Unbalanced XREAD list of streams")};
+    }
+
+    size_t half = values.size() / 2;
+    std::vector<std::string> keys(values.begin(), values.begin() + static_cast<long long>(half));
+    std::vector<std::string> idTokens(values.begin() + static_cast<long long>(half), values.end());
+
+    std::vector<std::pair<long long, long long>> cursors;
+    cursors.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); i++) {
+      bool wrongType = false;
+      bool invalid = false;
+      std::pair<long long, long long> cursor{0, 0};
+      if (!resolveXreadCursor(keys[i], idTokens[i], cursor, wrongType, invalid)) {
+        if (wrongType) {
+          return {true, encodeError("WRONGTYPE Operation against a key holding the wrong kind of value")};
+        }
+        if (invalid) {
+          return {true, encodeError("ERR Invalid stream ID specified as stream command argument")};
+        }
+      }
+      cursors.push_back(cursor);
+    }
+
+    bool wrongType = false;
+    std::vector<std::pair<std::string, std::vector<StreamItem>>> groups;
+    if (!buildXreadGroups(keys, cursors, groups, wrongType)) {
+      if (wrongType) {
+        return {true, encodeError("WRONGTYPE Operation against a key holding the wrong kind of value")};
+      }
+    }
+
+    if (!groups.empty()) {
+      return {true, encodeXreadResponse(groups)};
+    }
+
+    if (!blockMs.has_value()) {
+      return {true, encodeNullArray()};
+    }
+
+    std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt;
+    if (*blockMs > 0) {
+      deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(*blockMs);
+    }
+
+    pendingXreadRequests.push_back(XreadRequest{connection, keys, cursors, deadline});
+    return {false, ""};
   }
 
   if (command == "RPUSH" && cmd.size() >= 3) {
@@ -695,9 +1273,7 @@ int main() {
       ssize_t n = recv(c, buf, sizeof(buf), 0);
 #endif
       if (n <= 0) {
-        closeSocket(c);
-        connectionBuffers.erase(c);
-        clients.erase(clients.begin() + static_cast<long long>(i));
+        closeClient(c, clients);
         continue;
       }
 
@@ -717,9 +1293,7 @@ int main() {
       }
 
       if (!ok) {
-        closeSocket(c);
-        connectionBuffers.erase(c);
-        clients.erase(clients.begin() + static_cast<long long>(i));
+        closeClient(c, clients);
         continue;
       }
 
@@ -728,6 +1302,8 @@ int main() {
 
     wakePendingBlpopRequests();
     expirePendingBlpopRequests();
+    wakePendingXreadRequests();
+    expirePendingXreadRequests();
     flushDeadClients(clients);
   }
 
