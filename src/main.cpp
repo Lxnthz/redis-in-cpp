@@ -1364,7 +1364,7 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
   return {true, encodeError("ERR unknown command")};
 }
 
-int main() {
+int main(int argc, char* argv[]) {
 #ifdef _WIN32
   WSADATA wsaData;
   if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -1372,6 +1372,21 @@ int main() {
     return 1;
   }
 #endif
+
+  // Parse command-line arguments
+  int port = 6379;  // Default port
+  for (int i = 1; i < argc; i++) {
+    std::string arg = argv[i];
+    if (arg == "--port" && i + 1 < argc) {
+      try {
+        port = std::stoi(argv[i + 1]);
+        i++;  // Skip next arg since we consumed it
+      } catch (...) {
+        std::cerr << "Invalid port number\n";
+        return 1;
+      }
+    }
+  }
 
   SocketType serverFd = socket(AF_INET, SOCK_STREAM, 0);
   if (serverFd == kInvalidSocket) {
@@ -1393,11 +1408,11 @@ int main() {
 
   sockaddr_in serverAddr{};
   serverAddr.sin_family = AF_INET;
-  serverAddr.sin_port = htons(6379);
+  serverAddr.sin_port = htons(static_cast<uint16_t>(port));
   serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
 
   if (bind(serverFd, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) != 0) {
-    std::cerr << "Failed to bind to port 6379\n";
+    std::cerr << "Failed to bind to port " << port << "\n";
     closeSocket(serverFd);
     return 1;
   }
