@@ -66,6 +66,9 @@ static std::unordered_map<SocketType, std::string> connectionBuffers;
 static std::vector<BlpopRequest> pendingBlpopRequests;
 static std::vector<XreadRequest> pendingXreadRequests;
 static std::unordered_set<SocketType> socketsToClose;
+static std::unordered_map<SocketType, std::vector<std::vector<std::string>>> transactionCommands;
+static std::unordered_map<SocketType, std::unordered_map<std::string, int>> watchedKeys;
+static std::unordered_map<std::string, int> keyVersions;
 
 struct CommandResult {
   bool hasResponse;
@@ -98,6 +101,48 @@ static bool sendAll(SocketType s, const std::string& data) {
 
 static void markSocketForClose(SocketType s) {
   socketsToClose.insert(s);
+}
+
+static void touch_key(const std::string& key) {
+  keyVersions[key] = keyVersions.count(key) ? keyVersions[key] + 1 : 1;
+}
+
+static int get_key_version(const std::string& key) {
+  Entry* e = getEntry(key);
+  (void)e; // ensure expiry enforcement
+  return keyVersions.count(key) ? keyVersions[key] : 0;
+}
+
+static void watch_keys_for_connection(SocketType connection, const std::vector<std::string>& keys) {
+  auto &map = watchedKeys[connection];
+  for (const auto &k : keys) {
+    map[k] = get_key_version(k);
+  }
+}
+
+static void clear_watched_keys(SocketType connection) {
+  watchedKeys.erase(connection);
+}
+
+static std::vector<std::vector<std::string>>& get_transaction_queue(SocketType connection) {
+  return transactionCommands[connection];
+}
+
+static void clear_transaction(SocketType connection) {
+  transactionCommands.erase(connection);
+}
+
+static bool is_transaction_active(SocketType connection) {
+  return transactionCommands.find(connection) != transactionCommands.end();
+}
+
+static bool transaction_is_dirty(SocketType connection) {
+  auto it = watchedKeys.find(connection);
+  if (it == watchedKeys.end()) return false;
+  for (const auto &p : it->second) {
+    if (get_key_version(p.first) != p.second) return true;
+  }
+  return false;
 }
 
 static bool parseInt(const std::string& input, int& value) {
@@ -134,6 +179,7 @@ static std::vector<std::string>* getListForWrite(const std::string& key) {
   Entry* entry = getEntry(key);
   if (entry == nullptr) {
     store[key] = Entry{ValueType::kList, "", {}, {}, 0, 0, std::nullopt};
+    touch_key(key);
     return &store[key].listValue;
   }
 
@@ -563,6 +609,7 @@ static std::optional<std::vector<std::string>> popFromList(const std::string& ke
   if (!count.has_value()) {
     std::string popped = listValues->front();
     listValues->erase(listValues->begin());
+    touch_key(key);
     if (listValues->empty()) {
       store.erase(key);
     }
@@ -578,6 +625,7 @@ static std::optional<std::vector<std::string>> popFromList(const std::string& ke
   }
 
   if (listValues->empty()) {
+    touch_key(key);
     store.erase(key);
   }
 
@@ -807,6 +855,30 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
     return {true, encodeSimple("PONG")};
   }
 
+  if (command == "INCR" && cmd.size() >= 2) {
+    const std::string& key = cmd[1];
+    Entry* entry = getEntry(key);
+    if (entry == nullptr) {
+      store[key] = Entry{ValueType::kString, "1", {}, {}, 0, 0, std::nullopt};
+      touch_key(key);
+      return {true, encodeInteger(1)};
+    }
+
+    if (entry->type != ValueType::kString) {
+      return {true, encodeError("ERR value is not an integer or out of range")};
+    }
+
+    try {
+      long long cur = std::stoll(entry->stringValue);
+      cur += 1;
+      entry->stringValue = std::to_string(cur);
+      touch_key(key);
+      return {true, encodeInteger(cur)};
+    } catch (...) {
+      return {true, encodeError("ERR value is not an integer or out of range")};
+    }
+  }
+
   if (command == "ECHO") {
     if (cmd.size() < 2) {
       return {true, encodeError("ERR wrong number of arguments for 'echo' command")};
@@ -841,6 +913,7 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
     }
 
     store[key] = Entry{ValueType::kString, value, {}, {}, 0, 0, expiresAt};
+    touch_key(key);
     return {true, encodeSimple("OK")};
   }
 
@@ -936,7 +1009,7 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
       item.fields.push_back({cmd[i], cmd[i + 1]});
     }
     streamEntry->streamValue.push_back(item);
-
+    touch_key(key);
     wakePendingXreadRequests();
     return {true, encodeBulk(item.id)};
   }
@@ -1044,6 +1117,65 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
     return {false, ""};
   }
 
+  if (command == "WATCH") {
+    if (is_transaction_active(connection)) {
+      return {true, encodeError("ERR WATCH inside MULTI is not allowed")};
+    }
+    std::vector<std::string> keys(cmd.begin() + 1, cmd.end());
+    watch_keys_for_connection(connection, keys);
+    return {true, encodeSimple("OK")};
+  }
+
+  if (command == "UNWATCH") {
+    clear_watched_keys(connection);
+    return {true, encodeSimple("OK")};
+  }
+
+  if (command == "MULTI") {
+    if (!is_transaction_active(connection)) {
+      get_transaction_queue(connection); // create empty queue
+    }
+    return {true, encodeSimple("OK")};
+  }
+
+  if (command == "DISCARD") {
+    clear_transaction(connection);
+    clear_watched_keys(connection);
+    return {true, encodeSimple("OK")};
+  }
+
+  if (command == "EXEC") {
+    if (!is_transaction_active(connection)) {
+      return {true, encodeArray({})};
+    }
+
+    if (transaction_is_dirty(connection)) {
+      clear_transaction(connection);
+      clear_watched_keys(connection);
+      return {true, encodeNullArray()};
+    }
+
+    auto queued = get_transaction_queue(connection);
+    std::vector<std::string> results;
+    results.reserve(queued.size());
+    for (const auto& qcmd : queued) {
+      CommandResult r = executeCommand(connection, qcmd);
+      if (!r.hasResponse) {
+        results.push_back(encodeNullArray());
+      } else {
+        results.push_back(r.response);
+      }
+    }
+
+    clear_transaction(connection);
+    clear_watched_keys(connection);
+
+    // Build array reply
+    std::string out = "*" + std::to_string(results.size()) + "\r\n";
+    for (const auto& r : results) out += r;
+    return {true, out};
+  }
+
   if (command == "RPUSH" && cmd.size() >= 3) {
     std::vector<std::string>* listValues = getListForWrite(cmd[1]);
     if (listValues == nullptr) {
@@ -1055,6 +1187,7 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
     }
 
     long long lengthAfterPush = static_cast<long long>(listValues->size());
+    touch_key(cmd[1]);
     wakePendingBlpopRequests();
     return {true, encodeInteger(lengthAfterPush)};
   }
@@ -1070,6 +1203,7 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
     }
 
     long long lengthAfterPush = static_cast<long long>(listValues->size());
+    touch_key(cmd[1]);
     wakePendingBlpopRequests();
     return {true, encodeInteger(lengthAfterPush)};
   }
@@ -1165,6 +1299,16 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
 
     pendingBlpopRequests.push_back(BlpopRequest{connection, keys, deadline});
     return {false, ""};
+  }
+
+  // Transaction handling: if inside MULTI, queue commands (except transaction control)
+  if (is_transaction_active(connection)) {
+    std::string upper = command;
+    if (upper != "MULTI" && upper != "EXEC" && upper != "DISCARD" && upper != "WATCH" &&
+        upper != "UNWATCH") {
+      get_transaction_queue(connection).push_back(cmd);
+      return {true, encodeSimple("QUEUED")};
+    }
   }
 
   return {true, encodeError("ERR unknown command")};
