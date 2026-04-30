@@ -1150,6 +1150,9 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
   }
 
   if (command == "DISCARD") {
+    if (!is_transaction_active(connection)) {
+      return {true, encodeError("ERR DISCARD without MULTI")};
+    }
     clear_transaction(connection);
     clear_watched_keys(connection);
     return {true, encodeSimple("OK")};
