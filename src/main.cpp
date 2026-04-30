@@ -1148,7 +1148,7 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
 
   if (command == "EXEC") {
     if (!is_transaction_active(connection)) {
-      return {true, encodeArray({})};
+      return {true, encodeError("ERR EXEC without MULTI")};
     }
 
     if (transaction_is_dirty(connection)) {
