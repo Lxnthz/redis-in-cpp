@@ -70,6 +70,14 @@ static std::unordered_map<SocketType, std::vector<std::vector<std::string>>> tra
 static std::unordered_map<SocketType, std::unordered_map<std::string, int>> watchedKeys;
 static std::unordered_map<std::string, int> keyVersions;
 
+// Replication state
+static std::string role = "master";  // "master" or "slave"
+static std::string replication_id = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";  // Fixed replid for now
+static long long master_repl_offset = 0;
+static std::unordered_set<SocketType> replica_connections;
+static std::unordered_map<SocketType, long long> replica_ack_offsets;
+static std::unordered_map<SocketType, long long> replica_processed_offset;
+
 struct CommandResult {
   bool hasResponse;
   std::string response;
@@ -935,6 +943,27 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
     return {true, encodeBulk(getStringValue(cmd[1]))};
   }
 
+  if (command == "INFO") {
+    std::string section = "default";
+    if (cmd.size() >= 2) {
+      section = cmd[1];
+      // Convert to lowercase for comparison
+      std::transform(section.begin(), section.end(), section.begin(),
+                     [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    }
+
+    std::string info;
+    if (section == "replication" || section == "all" || section == "default") {
+      info = "# Replication\r\n";
+      info += "role:" + role + "\r\n";
+      info += "connected_slaves:0\r\n";
+      info += "master_replid:" + replication_id + "\r\n";
+      info += "master_repl_offset:" + std::to_string(master_repl_offset) + "\r\n";
+    }
+
+    return {true, encodeBulk(info)};
+  }
+
   if (command == "TYPE" && cmd.size() >= 2) {
     Entry* entry = getEntry(cmd[1]);
     if (entry == nullptr) {
@@ -1313,6 +1342,23 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
 
     pendingBlpopRequests.push_back(BlpopRequest{connection, keys, deadline});
     return {false, ""};
+  }
+
+  if (command == "WAIT" && cmd.size() >= 3) {
+    // WAIT numreplicas timeout
+    int numReplicas = 0;
+    if (!parseInt(cmd[1], numReplicas) || numReplicas < 0) {
+      return {true, encodeError("ERR numreplicas is not an integer or out of range")};
+    }
+
+    double timeoutSeconds = 0;
+    if (!parseDouble(cmd[2], timeoutSeconds) || timeoutSeconds < 0) {
+      return {true, encodeError("ERR timeout is not a float or out of range")};
+    }
+
+    // For now, with no replicas connected, return 0
+    // In full replication, this would track ACKs from connected replicas
+    return {true, encodeInteger(static_cast<long long>(replica_connections.size()))};
   }
 
   return {true, encodeError("ERR unknown command")};
