@@ -107,6 +107,8 @@ static void touch_key(const std::string& key) {
   keyVersions[key] = keyVersions.count(key) ? keyVersions[key] + 1 : 1;
 }
 
+static Entry* getEntry(const std::string& key);
+
 static int get_key_version(const std::string& key) {
   Entry* e = getEntry(key);
   (void)e; // ensure expiry enforcement
