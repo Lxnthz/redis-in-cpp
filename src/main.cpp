@@ -1167,6 +1167,9 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
     }
 
     auto queued = get_transaction_queue(connection);
+    clear_transaction(connection);
+    clear_watched_keys(connection);
+
     std::vector<std::string> results;
     results.reserve(queued.size());
     for (const auto& qcmd : queued) {
@@ -1177,9 +1180,6 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
         results.push_back(r.response);
       }
     }
-
-    clear_transaction(connection);
-    clear_watched_keys(connection);
 
     // Build array reply
     std::string out = "*" + std::to_string(results.size()) + "\r\n";
