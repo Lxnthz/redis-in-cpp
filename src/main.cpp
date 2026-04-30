@@ -857,6 +857,15 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
     return {true, encodeSimple("PONG")};
   }
 
+  // While inside MULTI, all non-transaction-control commands are queued.
+  if (is_transaction_active(connection)) {
+    if (command != "MULTI" && command != "EXEC" && command != "DISCARD" &&
+        command != "WATCH" && command != "UNWATCH") {
+      get_transaction_queue(connection).push_back(cmd);
+      return {true, encodeSimple("QUEUED")};
+    }
+  }
+
   if (command == "INCR" && cmd.size() >= 2) {
     const std::string& key = cmd[1];
     Entry* entry = getEntry(key);
@@ -1301,16 +1310,6 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
 
     pendingBlpopRequests.push_back(BlpopRequest{connection, keys, deadline});
     return {false, ""};
-  }
-
-  // Transaction handling: if inside MULTI, queue commands (except transaction control)
-  if (is_transaction_active(connection)) {
-    std::string upper = command;
-    if (upper != "MULTI" && upper != "EXEC" && upper != "DISCARD" && upper != "WATCH" &&
-        upper != "UNWATCH") {
-      get_transaction_queue(connection).push_back(cmd);
-      return {true, encodeSimple("QUEUED")};
-    }
   }
 
   return {true, encodeError("ERR unknown command")};
