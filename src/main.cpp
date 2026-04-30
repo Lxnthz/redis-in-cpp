@@ -77,6 +77,8 @@ static long long master_repl_offset = 0;
 static std::unordered_set<SocketType> replica_connections;
 static std::unordered_map<SocketType, long long> replica_ack_offsets;
 static std::unordered_map<SocketType, long long> replica_processed_offset;
+static std::string master_host = "";
+static int master_port = 0;
 
 struct CommandResult {
   bool hasResponse;
@@ -956,9 +958,17 @@ static CommandResult executeCommand(SocketType connection, const std::vector<std
     if (section == "replication" || section == "all" || section == "default") {
       info = "# Replication\r\n";
       info += "role:" + role + "\r\n";
-      info += "connected_slaves:0\r\n";
-      info += "master_replid:" + replication_id + "\r\n";
-      info += "master_repl_offset:" + std::to_string(master_repl_offset) + "\r\n";
+      
+      if (role == "master") {
+        info += "connected_slaves:0\r\n";
+        info += "master_replid:" + replication_id + "\r\n";
+        info += "master_repl_offset:" + std::to_string(master_repl_offset) + "\r\n";
+      } else {
+        // Slave-specific fields
+        info += "master_host:" + master_host + "\r\n";
+        info += "master_port:" + std::to_string(master_port) + "\r\n";
+        info += "master_link_status:connecting\r\n";  // For now, always connecting
+      }
     }
 
     return {true, encodeBulk(info)};
@@ -1383,6 +1393,17 @@ int main(int argc, char* argv[]) {
         i++;  // Skip next arg since we consumed it
       } catch (...) {
         std::cerr << "Invalid port number\n";
+        return 1;
+      }
+    } else if (arg == "--replicaof" && i + 2 < argc) {
+      // Parse master host and port
+      master_host = argv[i + 1];
+      try {
+        master_port = std::stoi(argv[i + 2]);
+        role = "slave";
+        i += 2;  // Skip next two args
+      } catch (...) {
+        std::cerr << "Invalid master port\n";
         return 1;
       }
     }
